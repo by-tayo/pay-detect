@@ -1,7 +1,9 @@
 # Payments Fraud Detection
 
 # Gradio App (with link)
+
 https://huggingface.co/spaces/bytayo/payments-fraud-detection
+
 ---
 ## 📃 Table of Contents
 
