@@ -1,0 +1,11 @@
+# Gradio / cache
+.gradio/
+__pycache__/
+
+# Data files
+*.xlsx
+*.csv
+
+# Environments / secrets
+.env
+venv/
