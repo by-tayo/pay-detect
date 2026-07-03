@@ -1,5 +1,5 @@
-### Payments Fraud Detection
-### Gradio App (with link)
+# Payments Fraud Detection
+# Gradio App (with link)
 
 ---
 
