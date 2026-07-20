@@ -87,6 +87,16 @@ The objectives are:
 * Deployed as an interactive **Gradio dashboard** (see link above) with an **auto-generated REST API** — every action in the app (training, SHAP explanations) is callable programmatically. From a running instance, see `<space-or-local-url>/?view=api` for the full API docs and example client code.
 
 ---
+## Images/Screenshots of the Work
+
+![Gradio UI 1](images/Gradio_UI_1.png)
+![Gradio UI 2](images/Gradio_UI_2.png)
+![Gradio UI 3](images/Gradio_UI_3.png)
+![Gradio UI 4](images/Gradio_UI_4.png)
+![Gradio UI 5](images/Gradio_UI_5.png)
+
+
+---
 
 ## 🚀 Future Improvements
 
