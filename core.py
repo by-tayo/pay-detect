@@ -26,6 +26,18 @@ try:
 except Exception:
     XGBOOST_AVAILABLE = False
 
+# Optional SHAP (explainable AI)
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except Exception:
+    SHAP_AVAILABLE = False
+
+# Models SHAP explainers are wired up for in this project
+SHAP_TREE_MODELS = ("Random Forest", "XGBoost")
+SHAP_LINEAR_MODELS = ("Logistic Regression",)
+SHAP_SUPPORTED_MODELS = SHAP_TREE_MODELS + SHAP_LINEAR_MODELS
+
 DATA_PATH = "fraud_data.csv"
 
 def generate_demo_data(n=5000, random_state=42):
@@ -145,6 +157,25 @@ def create_behavioral_features(data: pd.DataFrame, enable_rolling: bool = False)
         ref_avg = df["avg_amount_7"].replace(0, np.nan).fillna(fallback_mean)
         df["amount_deviation"] = df["amount"] - ref_avg
         df["amount_ratio"] = df["amount"] / (ref_avg + 1e-6)
+
+    # Fan-out / fan-in (behavioral graph features)
+    if "nameOrig" in df.columns and "nameDest" in df.columns:
+        df["orig_unique_dest_count"] = df.groupby("nameOrig")["nameDest"].transform("nunique")
+        df["dest_unique_orig_count"] = df.groupby("nameDest")["nameOrig"].transform("nunique")
+
+    # Transaction velocity: how many transactions this account made within a
+    # recent time window (assumes df is already sorted by step, see above).
+    if "nameOrig" in df.columns and "step" in df.columns:
+        VELOCITY_WINDOW = 6
+        df["orig_txn_velocity_window"] = 0.0
+        if enable_rolling:
+            def _velocity(steps):
+                arr = steps.to_numpy()
+                left = np.searchsorted(arr, arr - VELOCITY_WINDOW, side="left")
+                right = np.searchsorted(arr, arr, side="right")
+                return right - left
+
+            df["orig_txn_velocity_window"] = df.groupby("nameOrig")["step"].transform(_velocity)
 
     # Type patterns
     if "type" in df.columns:
@@ -332,3 +363,106 @@ def fig_corr_heatmap(df: pd.DataFrame, max_features=40):
     ax.set_title("Correlation Heatmap (numeric features)")
     plt.tight_layout()
     return fig
+
+
+# ---------- Explainable AI (SHAP) ----------
+def compute_shap_values(model, model_name, X_train, X_test, max_background=100, max_explain=200, random_state=42):
+    """
+    Build a SHAP explainer for a trained tree-based or linear model and
+    compute SHAP values for a sample of the test set.
+
+    Returns a dict with the raw shap values, the explainer's expected
+    (base) value, and the exact rows they were computed for — everything
+    needed to render a global summary plot or a single-row waterfall plot.
+    """
+    if not SHAP_AVAILABLE:
+        raise RuntimeError("The 'shap' package is not installed.")
+    if model_name not in SHAP_SUPPORTED_MODELS:
+        raise ValueError(
+            f"No SHAP explainer wired up for '{model_name}'. "
+            f"Supported: {', '.join(SHAP_SUPPORTED_MODELS)}."
+        )
+
+    X_background = X_train.sample(n=min(max_background, len(X_train)), random_state=random_state)
+    X_explain = X_test.sample(n=min(max_explain, len(X_test)), random_state=random_state).reset_index(drop=True)
+
+    if model_name in SHAP_TREE_MODELS:
+        explainer = shap.TreeExplainer(model)
+    else:
+        explainer = shap.LinearExplainer(model, X_background)
+
+    raw_values = explainer.shap_values(X_explain)
+
+    # Different SHAP explainer/model combos return slightly different shapes;
+    # normalize everything down to a single (n_samples, n_features) array
+    # representing the "fraud" (positive) class.
+    if isinstance(raw_values, list):
+        shap_values = raw_values[1] if len(raw_values) > 1 else raw_values[0]
+    else:
+        shap_values = raw_values
+        if shap_values.ndim == 3:
+            shap_values = shap_values[:, :, 1]
+
+    expected_value = explainer.expected_value
+    if isinstance(expected_value, (list, np.ndarray)):
+        expected_value = np.asarray(expected_value).reshape(-1)[-1]
+
+    return {
+        "model_name": model_name,
+        "shap_values": shap_values,
+        "expected_value": float(expected_value),
+        "X_explain": X_explain,
+    }
+
+
+def fig_shap_summary(shap_result, top_k=20):
+    """Global feature-impact plot: which features push predictions toward fraud."""
+    plt.close("all")
+    shap.summary_plot(
+        shap_result["shap_values"],
+        shap_result["X_explain"],
+        max_display=top_k,
+        show=False,
+    )
+    fig = plt.gcf()
+    fig.suptitle(f"SHAP Feature Impact — {shap_result['model_name']}")
+    fig.tight_layout()
+    return fig
+
+
+def fig_shap_waterfall(shap_result, row_index: int, max_display=15):
+    """Local explanation for a single transaction's fraud score."""
+    X_explain = shap_result["X_explain"]
+    if row_index < 0 or row_index >= len(X_explain):
+        raise IndexError(f"row_index must be between 0 and {len(X_explain) - 1}.")
+
+    explanation = shap.Explanation(
+        values=shap_result["shap_values"][row_index],
+        base_values=shap_result["expected_value"],
+        data=X_explain.iloc[row_index].values,
+        feature_names=list(X_explain.columns),
+    )
+
+    plt.close("all")
+    shap.plots.waterfall(explanation, max_display=max_display, show=False)
+    fig = plt.gcf()
+    fig.tight_layout()
+    return fig
+
+
+def top_shap_contributors(shap_result, row_index: int, top_k=5) -> str:
+    """Plain-language summary of the top SHAP contributors for one transaction."""
+    X_explain = shap_result["X_explain"]
+    if row_index < 0 or row_index >= len(X_explain):
+        raise IndexError(f"row_index must be between 0 and {len(X_explain) - 1}.")
+
+    row = shap_result["shap_values"][row_index]
+    feature_names = np.array(X_explain.columns)
+    order = np.argsort(np.abs(row))[::-1][:top_k]
+
+    lines = []
+    for i in order:
+        direction = "increases" if row[i] > 0 else "decreases"
+        value = X_explain.iloc[row_index][feature_names[i]]
+        lines.append(f"- **{feature_names[i]}** = `{value:.3f}` → {direction} the fraud score (SHAP = `{row[i]:+.4f}`)")
+    return "\n".join(lines)

@@ -10,6 +10,8 @@ import pandas as pd
 import numpy as np
 
 import core
+import deep_models
+from core import SHAP_AVAILABLE
 
 
 DEFAULT_CFG = {
@@ -24,7 +26,8 @@ DEFAULT_CFG = {
 
 def run_pipeline(
     sample_size, test_size, random_state,
-    enable_rolling, run_logreg, run_rf, run_xgb, threshold
+    enable_rolling, run_logreg, run_rf, run_xgb, threshold,
+    run_lstm, run_autoencoder, lstm_epochs, ae_epochs,
 ):
     cfg = {
         "sample_size": int(sample_size),
@@ -33,6 +36,8 @@ def run_pipeline(
         "run_logreg": bool(run_logreg),
         "run_rf": bool(run_rf),
         "run_xgb": bool(run_xgb),
+        "lstm_epochs": int(lstm_epochs),
+        "ae_epochs": int(ae_epochs),
     }
 
     # 1) load + sample
@@ -69,6 +74,24 @@ def run_pipeline(
 
     # 5) train traditional models
     model_results = core.train_traditional_models(X_train, y_train, X_test, y_test, cfg)
+
+    # 5b) optionally train deep learning models (LSTM, Autoencoder)
+    dl_status = []
+    if run_lstm:
+        try:
+            model_results["LSTM"] = deep_models.train_lstm_model(
+                data_enhanced, X, y, X_train.index, X_test.index, cfg
+            )
+        except Exception as e:
+            dl_status.append(f"⚠️ LSTM training failed: {e}")
+
+    if run_autoencoder:
+        try:
+            model_results["Autoencoder"] = deep_models.train_autoencoder_model(
+                X_train, y_train, X_test, y_test, cfg
+            )
+        except Exception as e:
+            dl_status.append(f"⚠️ Autoencoder training failed: {e}")
 
     # 6) select best
     best_name, best_auc = None, -1
@@ -130,6 +153,25 @@ def run_pipeline(
         if best_name
         else "### ⚠️ No model selected"
     )
+    if dl_status:
+        summary_md += "\n\n" + "\n\n".join(dl_status)
+
+    # Best *traditional* model (tree/linear) — used for SHAP explainability,
+    # since SHAP isn't wired up for the LSTM/Autoencoder here.
+    best_trad_name, best_trad_auc = None, -1
+    for name in core.SHAP_SUPPORTED_MODELS:
+        if name in model_results:
+            auc = model_results[name].get("test_auc", np.nan)
+            if not np.isnan(auc) and auc > best_trad_auc:
+                best_trad_auc = auc
+                best_trad_name = name
+
+    explain_state = {
+        "model_results": model_results,
+        "X_train": X_train,
+        "X_test": X_test,
+        "best_trad_name": best_trad_name,
+    }
 
     # Return outputs in the same order as Gradio components
     return (
@@ -140,6 +182,7 @@ def run_pipeline(
         cm_fig,
         report_text,
         feat_imp_fig,
+        explain_state,
     )
 
 
@@ -188,6 +231,22 @@ with gr.Blocks(title="Payments Fraud Detection — Gradio") as demo:
                 label=f"XGBoost (available={core.XGBOOST_AVAILABLE})",
             )
 
+            gr.Markdown("### 🧠 Deep Learning (sequential / anomaly-based)")
+            run_lstm = gr.Checkbox(
+                value=False,
+                label="LSTM — sequential fraud detection (uses each account's recent transaction history)",
+            )
+            run_autoencoder = gr.Checkbox(
+                value=False,
+                label="Autoencoder — anomaly-based fraud detection (trained on legit transactions only)",
+            )
+            lstm_epochs = gr.Slider(1, 20, value=5, step=1, label="LSTM epochs")
+            ae_epochs = gr.Slider(1, 30, value=15, step=1, label="Autoencoder epochs")
+            gr.Markdown(
+                "_Deep learning models are optional and slower than the traditional ones — "
+                "start with a smaller sample size while experimenting._"
+            )
+
             run_btn = gr.Button("🚀 Run Training Pipeline", variant="primary")
 
         with gr.Column(scale=2):
@@ -206,11 +265,35 @@ with gr.Blocks(title="Payments Fraud Detection — Gradio") as demo:
 
             report = gr.Textbox(label="Classification Report", lines=16)
 
+    gr.Markdown("---")
+    gr.Markdown("## 🔍 Explainability (XAI)")
+    gr.Markdown(
+        "Uses [SHAP](https://shap.readthedocs.io/) to interpret the best traditional "
+        "(Logistic Regression / Random Forest / XGBoost) model's fraud decisions — "
+        "run the training pipeline above first."
+        if SHAP_AVAILABLE
+        else "⚠️ The `shap` package isn't installed, so this section is disabled."
+    )
+
+    explain_state = gr.State()
+    shap_state = gr.State()
+
+    explain_info = gr.Markdown()
+    explain_btn = gr.Button("Generate Global SHAP Explanation", interactive=SHAP_AVAILABLE)
+    shap_summary_plot = gr.Plot(label="Global Feature Impact (SHAP Summary)")
+
+    with gr.Row():
+        txn_index = gr.Number(value=0, precision=0, label="Test-set transaction # to explain (from the SHAP sample)")
+        explain_txn_btn = gr.Button("Explain This Transaction", interactive=SHAP_AVAILABLE)
+    shap_waterfall_plot = gr.Plot(label="Local Explanation (SHAP Waterfall)")
+    shap_text = gr.Markdown()
+
     run_btn.click(
         fn=run_pipeline,
         inputs=[
             sample_size, test_size, random_state,
-            enable_rolling, run_logreg, run_rf, run_xgb, threshold
+            enable_rolling, run_logreg, run_rf, run_xgb, threshold,
+            run_lstm, run_autoencoder, lstm_epochs, ae_epochs,
         ],
         outputs=[
             summary,
@@ -220,7 +303,47 @@ with gr.Blocks(title="Payments Fraud Detection — Gradio") as demo:
             cm_plot,
             report,
             feat_imp_plot,
+            explain_state,
         ],
+    )
+
+    def generate_shap_summary(state):
+        if not state or not state.get("best_trad_name"):
+            return "⚠️ Run the training pipeline first, with at least one traditional model enabled.", None, None
+
+        name = state["best_trad_name"]
+        model = state["model_results"][name]["model"]
+        shap_result = core.compute_shap_values(model, name, state["X_train"], state["X_test"])
+        fig = core.fig_shap_summary(shap_result)
+        info = (
+            f"### Explaining **{name}** "
+            f"(Test AUC: `{state['model_results'][name]['test_auc']:.4f}`)  \n"
+            f"Pick a transaction # below (0 to {len(shap_result['X_explain']) - 1}) and click "
+            f"**Explain This Transaction** for a per-transaction breakdown."
+        )
+        return info, fig, shap_result
+
+    explain_btn.click(
+        fn=generate_shap_summary,
+        inputs=[explain_state],
+        outputs=[explain_info, shap_summary_plot, shap_state],
+    )
+
+    def explain_transaction(shap_result, row_index):
+        if not shap_result:
+            return None, "⚠️ Generate the global SHAP explanation first."
+        try:
+            row_index = int(row_index)
+            fig = core.fig_shap_waterfall(shap_result, row_index)
+            text = core.top_shap_contributors(shap_result, row_index)
+            return fig, f"### Top contributing features for transaction #{row_index}\n\n{text}"
+        except (IndexError, ValueError) as e:
+            return None, f"⚠️ {e}"
+
+    explain_txn_btn.click(
+        fn=explain_transaction,
+        inputs=[shap_state, txn_index],
+        outputs=[shap_waterfall_plot, shap_text],
     )
 
 demo.queue().launch()
